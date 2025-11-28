@@ -62,10 +62,14 @@ CHANNELS = 1
 
 # Silero VAD settings
 SILERO_THRESHOLD = 0.9
-VOLUME_THRESHOLD = 2000
-VOLUME_THRESHOLD_TRIGGERED = 500  # Lower threshold once speech is detected
+VOLUME_THRESHOLD = 7000  # Main threshold for triggering speech capture
+VOLUME_THRESHOLD_LOW = 2000  # If speech detected between LOW and THRESHOLD, play reminder
+VOLUME_THRESHOLD_TRIGGERED = 1000  # Lower threshold once speech is detected
 SILENCE_DURATION_MS = 500
 SILENCE_CHUNKS = int((SILENCE_DURATION_MS / 1000) * SILERO_SAMPLE_RATE / VAD_CHUNK_SIZE)
+
+# Pre-recorded messages
+SPEAK_UP_REMINDER = "speak_up_reminder.mp3"  # Santa saying "speak loud and clearly"
 
 print("🔄 Initializing Silero VAD...")
 silero_model = load_silero_vad()
@@ -121,21 +125,51 @@ SANTA_OPENERS = [
 current_state = {
     'transcribing': False,
     'llm_thinking': False,
-    'tts_generating': False,  # NEW: Track when TTS is generating audio
+    'tts_generating': False,  # Track when TTS is generating audio
     'playing_audio': False,
     'was_interrupted': False,  # Track if we interrupted playback
     'last_transcription': '',
     'last_transcription_time': 0,
-    'interrupted': False
+    'interrupted': False,
+    'last_activity_time': time.time()  # Track last speech activity
 }
 state_lock = threading.Lock()
 
 INTERRUPTION_MERGE_WINDOW = 2.0  # Merge if interrupted within 2 seconds
+CONVERSATION_TIMEOUT = 45.0  # Clear conversation after 45 seconds of silence
 
 import queue
 
 # Global queue for audio recordings
 audio_queue = queue.Queue()
+
+
+def play_speak_up_reminder():
+    """Play pre-recorded reminder to speak louder"""
+    global current_playback_process
+    
+    if not os.path.exists(SPEAK_UP_REMINDER):
+        print(f"⚠️ Speak up reminder file not found: {SPEAK_UP_REMINDER}")
+        return
+    
+    print("🔊 Playing speak up reminder...")
+    
+    with playback_lock:
+        # Stop any current playback first
+        if current_playback_process and current_playback_process.poll() is None:
+            try:
+                current_playback_process.kill()
+            except:
+                pass
+        
+        current_playback_process = subprocess.Popen(
+            ['ffplay', '-nodisp', '-autoexit', '-volume', '10', SPEAK_UP_REMINDER],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    
+    with state_lock:
+        current_state['playing_audio'] = True
 
 
 def downsample_for_vad(chunk, from_rate, to_rate, target_samples=512):
@@ -246,6 +280,25 @@ def continuous_vad_loop():
             # Use lower threshold once triggered to keep capturing
             active_volume_threshold = VOLUME_THRESHOLD_TRIGGERED if triggered else VOLUME_THRESHOLD
             
+            # Check for low volume speech (between LOW and main threshold) - only when not triggered
+            if not triggered and VOLUME_THRESHOLD_LOW <= volume < VOLUME_THRESHOLD:
+                # Check if this might be speech using Silero
+                audio_resampled = downsample_for_vad(chunk, MIC_SAMPLE_RATE, SILERO_SAMPLE_RATE, VAD_CHUNK_SIZE)
+                audio_tensor = torch.from_numpy(audio_resampled.astype(np.float32))
+                
+                if len(audio_tensor) == VAD_CHUNK_SIZE:
+                    speech_prob = silero_model(audio_tensor, SILERO_SAMPLE_RATE).item()
+                    if speech_prob > SILERO_THRESHOLD:
+                        print(f"\n🔈 Low volume speech detected (vol={int(volume)}, prob={speech_prob:.2f})")
+                        print("📢 Playing speak up reminder...")
+                        # Play reminder in background thread to not block VAD
+                        threading.Thread(target=play_speak_up_reminder, daemon=True).start()
+                        # Reset Silero state after playing reminder
+                        silero_model.reset_states()
+                        # Skip a bit to avoid repeated triggers
+                        time.sleep(0.5)
+                        continue
+            
             # Skip if volume is too low
             if volume < active_volume_threshold:
                 if not triggered:
@@ -283,6 +336,16 @@ def continuous_vad_loop():
                     
                     # Check what's currently running and interrupt
                     with state_lock:
+                        # Check if conversation timed out
+                        time_since_last = time.time() - current_state['last_activity_time']
+                        if time_since_last > CONVERSATION_TIMEOUT:
+                            print(f"⏰ Conversation timed out ({time_since_last:.1f}s), starting fresh!")
+                            with conversation_lock:
+                                conversation_history.clear()
+                        
+                        # Update activity time
+                        current_state['last_activity_time'] = time.time()
+                        
                         if current_state['playing_audio']:
                             print("🛑 Interrupting audio playback...")
                             current_state['was_interrupted'] = True
