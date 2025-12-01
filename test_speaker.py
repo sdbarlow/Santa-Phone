@@ -4,17 +4,13 @@ import numpy as np
 import torch
 import wave
 from collections import deque
-import audioop
 import os
 import warnings
 import signal
-import anthropic
 import subprocess
 import time
 from elevenlabs.client import ElevenLabs
-from elevenlabs import stream as elevenlabs_stream
 from groq import Groq
-import random
 import threading
 import psutil
 from dotenv import load_dotenv
@@ -61,11 +57,11 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 1
 
 # Silero VAD settings
-SILERO_THRESHOLD = 0.9
-VOLUME_THRESHOLD = 7000  # Main threshold for triggering speech capture
-VOLUME_THRESHOLD_LOW = 2000  # If speech detected between LOW and THRESHOLD, play reminder
-VOLUME_THRESHOLD_TRIGGERED = 1000  # Lower threshold once speech is detected
-SILENCE_DURATION_MS = 500
+SILERO_THRESHOLD = 0.90
+VOLUME_THRESHOLD = 1244       # Must be clearly louder than ambient
+VOLUME_THRESHOLD_LOW = 763   # Wide gap for "speak up" zone
+VOLUME_THRESHOLD_TRIGGERED = 391  # Keep capturing through brief quiet moments
+SILENCE_DURATION_MS = 350
 SILENCE_CHUNKS = int((SILENCE_DURATION_MS / 1000) * SILERO_SAMPLE_RATE / VAD_CHUNK_SIZE)
 
 # Pre-recorded messages
@@ -74,12 +70,6 @@ SPEAK_UP_REMINDER = "speak_up_reminder.mp3"  # Santa saying "speak loud and clea
 print("🔄 Initializing Silero VAD...")
 silero_model = load_silero_vad()
 print("✅ Silero VAD ready!\n")
-
-print("🔄 Initializing Claude...")
-claude_client = anthropic.Anthropic(
-    api_key=os.environ.get("CLAUDE_API_KEY", "your-key-here")
-)
-print("✅ Claude ready!\n")
 
 print("🔄 Initializing ElevenLabs...")
 elevenlabs_client = ElevenLabs(
@@ -97,21 +87,26 @@ SANTA_VOICE_ID = "Gqe8GJJLg3haJkTwYj2L"
 
 SANTA_SYSTEM_PROMPT = '''You are Santa Claus speaking to children at a toy store during the Christmas season. Keep responses to EXACTLY 1 sentence - never more.
 
+IMPORTANT CONTEXT:
+- A pre-recorded greeting ("Ho ho ho! Merry Christmas! Who do we have here?") has ALREADY played before the child speaks
+- A thinking sound like "Hmm..." or "Well now..." may have ALREADY played before your response
+- Do NOT repeat greetings or thinking phrases - go directly into your response
+- Never start with "Ho ho ho", "Well", "Hmm", "Let me see", or similar - those are already covered
+
 Personality:
 - Warm, jolly, and genuinely interested in each child
-- Use "ho ho ho" sparingly (only for greetings or excitement)
 - Speak naturally like a kind grandfather, not overly formal
 - Remember details children share (names, wishes, siblings, pets)
 
 Guidelines:
 - Ask about their Christmas wishes, how they've been good, siblings, pets, or school
-- If they tell you their name, use it in future responses
+- If they tell you their name, use it warmly in your response
 - If they ask for something, respond warmly but don't make specific promises
 - Keep the magic alive - reference the North Pole, elves, reindeer, Mrs. Claus naturally
 - Be encouraging about good behavior without being preachy
 - If they seem shy, be extra gentle and patient
 
-Remember: ONE sentence only. Make every word count.'''
+Remember: ONE sentence only. No greeting prefixes. Make every word count.'''
 
 max_tokens=50 
 
@@ -120,6 +115,14 @@ SANTA_OPENERS = [
     "opener_oh_ho_ho.mp3",
 ]
 
+# Thinking sounds - played while LLM is processing
+# These are neutral "acknowledgment" sounds, not full phrases
+# The LLM is told these already played, so it won't repeat them
+THINKING_SOUNDS = [
+    "thinking_ho_ho_ho.mp3",
+]
+
+import random
 
 # Global state tracking
 current_state = {
@@ -131,9 +134,17 @@ current_state = {
     'last_transcription': '',
     'last_transcription_time': 0,
     'interrupted': False,
-    'last_activity_time': time.time()  # Track last speech activity
+    'last_activity_time': time.time(),  # Track last speech activity
+    'audio_playing_at_trigger': False,  # Was audio playing when speech triggered?
+    'playback_end_time': 0,  # When did playback end?
+    'stop_thinking_sound': False,  # Signal to stop thinking sound
+    'reset_silero': False,  # Signal VAD to reset Silero state
 }
 state_lock = threading.Lock()
+
+# Echo detection settings
+ECHO_DETECTION_WINDOW = 0.5  # Seconds after playback ends to suspect echo
+MIN_REAL_SPEECH_FRAMES = 30  # Minimum frames for real speech (not echo)
 
 INTERRUPTION_MERGE_WINDOW = 2.0  # Merge if interrupted within 2 seconds
 CONVERSATION_TIMEOUT = 45.0  # Clear conversation after 45 seconds of silence
@@ -142,6 +153,62 @@ import queue
 
 # Global queue for audio recordings
 audio_queue = queue.Queue()
+
+# Thinking sound process (separate from main playback)
+thinking_sound_process = None
+thinking_sound_lock = threading.Lock()
+
+
+def play_thinking_sound():
+    """Play a random thinking sound while LLM processes - runs in background thread"""
+    global thinking_sound_process
+    
+    # Find available thinking sounds
+    available_sounds = [s for s in THINKING_SOUNDS if os.path.exists(s)]
+    
+    if not available_sounds:
+        print("⚠️ No thinking sounds found, skipping...")
+        return
+    
+    # Pick a random one
+    sound_file = random.choice(available_sounds)
+    print(f"🤔 Playing thinking sound: {sound_file}")
+    
+    with thinking_sound_lock:
+        # Check if we should stop before starting
+        with state_lock:
+            if current_state['stop_thinking_sound'] or current_state['interrupted']:
+                print("🤔 Thinking sound cancelled before start")
+                return
+        
+        try:
+            thinking_sound_process = subprocess.Popen(
+                ['ffplay', '-nodisp', '-autoexit', '-volume', '8', sound_file],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            
+            # Wait for it to finish or be stopped
+            thinking_sound_process.wait()
+            
+        except Exception as e:
+            print(f"⚠️ Thinking sound error: {e}")
+        finally:
+            thinking_sound_process = None
+
+
+def stop_thinking_sound():
+    """Stop the thinking sound if it's playing"""
+    global thinking_sound_process
+    
+    with thinking_sound_lock:
+        if thinking_sound_process and thinking_sound_process.poll() is None:
+            print("🤔 Stopping thinking sound")
+            try:
+                thinking_sound_process.kill()
+            except:
+                pass
+            thinking_sound_process = None
 
 
 def play_speak_up_reminder():
@@ -170,6 +237,61 @@ def play_speak_up_reminder():
     
     with state_lock:
         current_state['playing_audio'] = True
+
+
+def play_opener(wait_for_finish=True):
+    """Play a random Santa opener greeting
+    
+    Args:
+        wait_for_finish: If True, wait until audio finishes (but still interruptible)
+    """
+    global current_playback_process
+    
+    # Find available openers
+    available_openers = [s for s in SANTA_OPENERS if os.path.exists(s)]
+    
+    if not available_openers:
+        print("⚠️ No opener audio files found, skipping greeting...")
+        return
+    
+    # Pick a random opener
+    opener_file = random.choice(available_openers)
+    print(f"🎅 Playing opener: {opener_file}")
+    
+    with playback_lock:
+        # Stop any current playback first
+        if current_playback_process and current_playback_process.poll() is None:
+            try:
+                current_playback_process.kill()
+            except:
+                pass
+        
+        current_playback_process = subprocess.Popen(
+            ['ffplay', '-nodisp', '-autoexit', '-volume', '10', opener_file],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    
+    with state_lock:
+        current_state['playing_audio'] = True
+        current_state['last_activity_time'] = time.time()
+    
+    if wait_for_finish:
+        # Poll for completion instead of blocking - allows interruption
+        while current_playback_process and current_playback_process.poll() is None:
+            # Check if we were interrupted
+            with state_lock:
+                if current_state['interrupted']:
+                    print("🎅 Opener interrupted!")
+                    break
+            time.sleep(0.05)  # Small sleep to avoid busy-waiting
+        
+        with state_lock:
+            current_state['playing_audio'] = False
+            current_state['playback_end_time'] = time.time()
+            current_state['reset_silero'] = True  # Reset Silero after playback
+        
+        print("🎅 Opener finished, ready for child to speak!")
 
 
 def downsample_for_vad(chunk, from_rate, to_rate, target_samples=512):
@@ -258,12 +380,25 @@ def continuous_vad_loop():
         ring_buffer = deque(maxlen=10)
         silence_count = 0
         chunk_count = 0
+        consecutive_quiet_chunks = 0  # Track quiet periods to reset Silero
+        last_silero_reset = time.time()
+        
+        SILERO_RESET_INTERVAL = 5.0  # Reset every 5 seconds of non-triggered listening
+        QUIET_CHUNKS_FOR_RESET = 100  # Reset after ~3 seconds of quiet
         
         print("👂 Listening...")
         
         while True:
             chunk_count += 1
             chunk = stream.read(MIC_CHUNK_SIZE, exception_on_overflow=False)
+            
+            # Check if we need to reset Silero (after TTS playback)
+            with state_lock:
+                if current_state['reset_silero']:
+                    current_state['reset_silero'] = False
+                    print("\n🔄 Resetting Silero state (post-playback)...")
+                    silero_model.reset_states()
+                    last_silero_reset = time.time()
             
             # Calculate volume
             audio_int16 = np.frombuffer(chunk, dtype=np.int16)
@@ -272,6 +407,27 @@ def continuous_vad_loop():
             
             if not np.isfinite(volume):
                 volume = 0
+            
+            # Track quiet periods and reset Silero periodically when not triggered
+            if not triggered:
+                if volume < VOLUME_THRESHOLD_LOW:
+                    consecutive_quiet_chunks += 1
+                else:
+                    consecutive_quiet_chunks = 0
+                
+                # Reset Silero if it's been quiet for a while (state might be stale)
+                if consecutive_quiet_chunks >= QUIET_CHUNKS_FOR_RESET:
+                    silero_model.reset_states()
+                    consecutive_quiet_chunks = 0
+                    last_silero_reset = time.time()
+                    # Don't print to avoid spam, but uncomment for debugging:
+                    # print("\n🔄 Silero reset (quiet period)")
+                
+                # Also reset periodically based on time
+                if time.time() - last_silero_reset > SILERO_RESET_INTERVAL:
+                    silero_model.reset_states()
+                    last_silero_reset = time.time()
+                    # print("\n🔄 Silero reset (periodic)")
             
             # Print volume every 50 chunks
             if chunk_count % 50 == 0:
@@ -334,23 +490,34 @@ def continuous_vad_loop():
                 if is_speech:
                     print(f"\n🚨 SPEECH DETECTED!", flush=True)
                     
-                    # Check what's currently running and interrupt
+                    # First, collect state and set flags (quick lock acquire/release)
+                    need_to_stop_audio = False
+                    need_to_stop_thinking = False
+                    should_clear_conversation = False
+                    
                     with state_lock:
                         # Check if conversation timed out
                         time_since_last = time.time() - current_state['last_activity_time']
                         if time_since_last > CONVERSATION_TIMEOUT:
                             print(f"⏰ Conversation timed out ({time_since_last:.1f}s), starting fresh!")
-                            with conversation_lock:
-                                conversation_history.clear()
+                            should_clear_conversation = True
                         
                         # Update activity time
                         current_state['last_activity_time'] = time.time()
+                        
+                        # Track if audio was playing when we triggered (possible echo)
+                        was_playing = current_state['playing_audio'] or current_state['tts_generating']
+                        time_since_playback = time.time() - current_state['playback_end_time']
+                        current_state['audio_playing_at_trigger'] = was_playing or (time_since_playback < ECHO_DETECTION_WINDOW)
+                        
+                        if current_state['audio_playing_at_trigger']:
+                            print("⚠️ Audio was playing - this might be echo, will verify...")
                         
                         if current_state['playing_audio']:
                             print("🛑 Interrupting audio playback...")
                             current_state['was_interrupted'] = True
                             current_state['playing_audio'] = False
-                            stop_all_audio(clear_state=False)
+                            need_to_stop_audio = True
                         if current_state['tts_generating']:
                             print("🛑 Interrupting TTS generation...")
                             current_state['was_interrupted'] = True
@@ -361,6 +528,19 @@ def continuous_vad_loop():
                         if current_state['llm_thinking']:
                             print("🛑 Interrupting LLM...")
                             current_state['interrupted'] = True
+                            current_state['stop_thinking_sound'] = True
+                            need_to_stop_thinking = True
+                    
+                    # Now perform actions OUTSIDE the state_lock to avoid deadlock
+                    if should_clear_conversation:
+                        with conversation_lock:
+                            conversation_history.clear()
+                    
+                    if need_to_stop_audio:
+                        stop_all_audio(clear_state=False)  # Safe now - we don't hold state_lock
+                    
+                    if need_to_stop_thinking:
+                        stop_thinking_sound()
                     
                     triggered = True
                     voiced_frames.extend(ring_buffer)
@@ -387,8 +567,18 @@ def continuous_vad_loop():
         stream.close()
         audio.terminate()
         
+        # Check if this might be echo (audio was playing + short capture)
+        with state_lock:
+            might_be_echo = current_state['audio_playing_at_trigger']
+            current_state['audio_playing_at_trigger'] = False  # Reset for next capture
+        
+        # Filter out likely echo: short recordings that triggered during playback
+        if might_be_echo and len(voiced_frames) < MIN_REAL_SPEECH_FRAMES:
+            print(f"🔇 Discarding likely echo ({len(voiced_frames)} frames < {MIN_REAL_SPEECH_FRAMES} minimum)")
+            continue  # Skip to next VAD session without queuing
+        
         # Add audio data to queue for processing (as tuple with metadata)
-        audio_queue.put((audio_data, MIC_SAMPLE_RATE, sample_width, CHANNELS))
+        audio_queue.put((audio_data, MIC_SAMPLE_RATE, sample_width, CHANNELS, might_be_echo))
         print(f"📦 Added to queue (queue size: {audio_queue.qsize()})")
         
         # Continue immediately to next VAD session (no waiting!)
@@ -398,7 +588,12 @@ def transcribe_audio(audio_tuple):
     """Transcribe audio using Groq Whisper - can be interrupted"""
     print("📝 Transcribing with Groq...")
     
-    audio_data, sample_rate, sample_width, channels = audio_tuple
+    # Handle both old (4-tuple) and new (5-tuple) format
+    if len(audio_tuple) == 5:
+        audio_data, sample_rate, sample_width, channels, might_be_echo = audio_tuple
+    else:
+        audio_data, sample_rate, sample_width, channels = audio_tuple
+        might_be_echo = False
     
     with state_lock:
         current_state['transcribing'] = True
@@ -450,10 +645,10 @@ def transcribe_audio(audio_tuple):
 
 
 def text_to_speech_and_play_streaming(text):
-    """Convert text to speech, save to file, and play - interruptible"""
+    """Convert text to speech and stream directly to ffplay - no disk I/O"""
     global current_playback_process
     
-    print(f"🔊 [TTS] Starting TTS for: '{text[:50]}...'")
+    print(f"🔊 [TTS] Starting streaming TTS for: '{text[:50]}...'")
     tts_start = time.time()
     
     # Mark that we're generating TTS
@@ -461,55 +656,93 @@ def text_to_speech_and_play_streaming(text):
         current_state['tts_generating'] = True
     
     try:
-        # Generate audio and save to file
+        # Check if interrupted before starting
+        with state_lock:
+            if current_state['interrupted']:
+                print("⚠️ [TTS] Skipping - already interrupted!")
+                current_state['tts_generating'] = False
+                return False
+        
+        # Stop any existing playback
+        stop_all_audio()
+        
+        # Start ffplay process that reads from stdin pipe
+        with playback_lock:
+            current_playback_process = subprocess.Popen(
+                ['ffplay', '-nodisp', '-autoexit', '-volume', '10', '-i', 'pipe:0'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            print(f"🎵 [TTS] Started ffplay pipe (PID: {current_playback_process.pid})")
+        
+        # Set playing state immediately since we're streaming
+        with state_lock:
+            current_state['playing_audio'] = True
+        
+        # Generate audio and stream directly to ffplay
         audio_generator = elevenlabs_client.text_to_speech.convert(
             text=text,
             voice_id=SANTA_VOICE_ID,
             model_id="eleven_turbo_v2",
-            optimize_streaming_latency=2,
+            optimize_streaming_latency=3,  # Max optimization for lowest latency
             output_format="mp3_44100_128"
         )
         
-        # Save to temporary file, checking for interruption
-        temp_file = "santa_response.mp3"
-        with open(temp_file, "wb") as f:
-            for chunk in audio_generator:
-                # Check if interrupted during generation
-                with state_lock:
-                    if current_state['interrupted']:
-                        print("⚠️ [TTS] Generation interrupted!")
-                        current_state['tts_generating'] = False
-                        return False
-                
-                if isinstance(chunk, bytes):
-                    f.write(chunk)
+        first_chunk_time = None
+        bytes_written = 0
         
-        print(f"🎵 [TTS] Audio saved in {time.time() - tts_start:.2f}s")
-        
-        # Check again before starting playback
-        with state_lock:
+        for chunk in audio_generator:
+            # Check if interrupted during streaming
+            with state_lock:
+                if current_state['interrupted']:
+                    print("⚠️ [TTS] Streaming interrupted!")
+                    current_state['tts_generating'] = False
+                    current_state['playing_audio'] = False
+            
+            # Handle interruption outside the lock
             if current_state['interrupted']:
-                print("⚠️ [TTS] Skipping playback - interrupted!")
-                current_state['tts_generating'] = False
+                # Close stdin to stop ffplay gracefully
+                try:
+                    current_playback_process.stdin.close()
+                except:
+                    pass
+                stop_all_audio(clear_state=False)  # State already cleared above
                 return False
-            current_state['tts_generating'] = False
+            
+            if isinstance(chunk, bytes):
+                if first_chunk_time is None:
+                    first_chunk_time = time.time()
+                    print(f"🎵 [TTS] First audio chunk received in {first_chunk_time - tts_start:.2f}s")
+                
+                try:
+                    current_playback_process.stdin.write(chunk)
+                    current_playback_process.stdin.flush()
+                    bytes_written += len(chunk)
+                except (BrokenPipeError, OSError) as e:
+                    print(f"⚠️ [TTS] Pipe error (playback stopped?): {e}")
+                    break
         
-        # Now play it
-        print(f"🎧 [TTS] Starting playback...")
+        # Close stdin to signal end of audio
+        try:
+            current_playback_process.stdin.close()
+        except:
+            pass
         
-        stop_all_audio()
+        print(f"🎵 [TTS] Streamed {bytes_written} bytes in {time.time() - tts_start:.2f}s")
         
-        with playback_lock:
-            current_playback_process = subprocess.Popen(
-                ['ffplay', '-nodisp', '-autoexit', '-volume', '10', temp_file],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            print(f"🎵 [TTS] Started playback (PID: {current_playback_process.pid})")
+        # Wait for playback to actually finish, then record end time
+        try:
+            current_playback_process.wait(timeout=30)  # Wait up to 30s for playback
+        except:
+            pass
         
-        # ONLY NOW set playing_audio = True (when actually playing)
         with state_lock:
-            current_state['playing_audio'] = True
+            current_state['tts_generating'] = False
+            current_state['playing_audio'] = False
+            current_state['playback_end_time'] = time.time()
+            current_state['reset_silero'] = True  # Signal VAD to reset Silero
+            print(f"🎵 [TTS] Playback finished, recorded end time")
         
         return True
         
@@ -536,16 +769,17 @@ def get_santa_response(child_text):
         conversation_history.append({"role": "user", "content": child_text})
         
         if len(conversation_history) > MAX_HISTORY_MESSAGES:
-            conversation_history = conversation_history[-MAX_HISTORY_MESSAGES:]
+            conversation_history[:] = conversation_history[-MAX_HISTORY_MESSAGES:]
         
         messages = [
             {"role": "system", "content": SANTA_SYSTEM_PROMPT}
         ] + conversation_history
     
     try:
+        # CHANGED: Using faster 8B model instead of 70B
         chat_completion = groq_client.chat.completions.create(
             messages=messages,
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",  # Much faster than llama-3.3-70b-versatile
             temperature=0.9,
             max_tokens=max_tokens,
             stream=True
@@ -559,13 +793,18 @@ def get_santa_response(child_text):
                 if current_state['interrupted']:
                     print("⚠️ LLM interrupted!")
                     current_state['llm_thinking'] = False
+                    current_state['stop_thinking_sound'] = True
+                    stop_thinking_sound()
                     return None
             
             if chunk.choices[0].delta.content:
                 santa_response += chunk.choices[0].delta.content
         
+        # Stop thinking sound before TTS starts
         with state_lock:
             current_state['llm_thinking'] = False
+            current_state['stop_thinking_sound'] = True
+        stop_thinking_sound()
         
         with conversation_lock:
             conversation_history.append({"role": "assistant", "content": santa_response})
@@ -597,36 +836,113 @@ if __name__ == "__main__":
         vad_thread = threading.Thread(target=continuous_vad_loop, daemon=True)
         vad_thread.start()
         
+        # Accumulator for audio that was interrupted before transcription
+        pending_audio_chunks = []
+        
         while True:
             # Wait for audio from queue
             audio_tuple = audio_queue.get()
             print(f"\n📥 Processing audio from queue...")
             
+            # Extract audio data and echo flag
+            audio_data = audio_tuple[0]
+            sample_rate = audio_tuple[1]
+            sample_width = audio_tuple[2]
+            channels = audio_tuple[3]
+            might_be_echo = audio_tuple[4] if len(audio_tuple) == 5 else False
+            
+            # Check if there's more audio waiting (rapid speech)
+            # If so, accumulate before transcribing
+            accumulated_audio = [audio_data]
+            
+            # Give a tiny moment for any rapid follow-up audio to arrive
+            time.sleep(0.05)
+            
+            while not audio_queue.empty():
+                try:
+                    next_tuple = audio_queue.get_nowait()
+                    print(f"📦 Merging additional audio from queue...")
+                    accumulated_audio.append(next_tuple[0])
+                except:
+                    break
+            
+            # Also add any pending audio from interrupted transcriptions
+            if pending_audio_chunks:
+                print(f"📦 Including {len(pending_audio_chunks)} pending audio chunk(s) from interrupted transcription")
+                accumulated_audio = pending_audio_chunks + accumulated_audio
+                pending_audio_chunks = []
+            
+            # Combine all audio
+            if len(accumulated_audio) > 1:
+                print(f"🔗 Combining {len(accumulated_audio)} audio segments...")
+                combined_audio = b''.join(accumulated_audio)
+            else:
+                combined_audio = accumulated_audio[0]
+            
+            # Create combined tuple for transcription
+            combined_tuple = (combined_audio, sample_rate, sample_width, channels, might_be_echo)
+            
+            # Stop any existing audio playback before thinking sound
+            stop_all_audio()
+            stop_thinking_sound()
+            
+            # Start thinking sound immediately - gives feedback while we transcribe
+            with state_lock:
+                current_state['stop_thinking_sound'] = False
+            thinking_thread = threading.Thread(target=play_thinking_sound, daemon=True)
+            thinking_thread.start()
+            
             # Transcribe
-            text = transcribe_audio(audio_tuple)
+            text = transcribe_audio(combined_tuple)
+            
+            # Check if transcription was interrupted
+            with state_lock:
+                was_interrupted_during_transcription = current_state['interrupted']
+            
+            if was_interrupted_during_transcription:
+                # Save this audio for later - it will be merged with the next capture
+                print(f"💾 Saving interrupted audio for merge with next capture")
+                pending_audio_chunks.append(combined_audio)
+                continue
             
             if not text or len(text.strip()) < 3:
                 print("⚠️ No clear speech detected, continuing to listen...\n")
                 continue
             
-            # Check if this was an interruption
+            # Filter out likely echo based on transcription content
+            if might_be_echo:
+                text_lower = text.lower().strip()
+                # Common echo artifacts: very short, or contains Santa's typical phrases
+                echo_indicators = [
+                    len(text_lower) < 10,  # Very short transcriptions
+                    "ho ho" in text_lower,  # Santa's laugh
+                    "merry christmas" in text_lower,
+                    "north pole" in text_lower,
+                    "mrs. claus" in text_lower,
+                    "reindeer" in text_lower,
+                    "elves" in text_lower,
+                ]
+                if any(echo_indicators):
+                    print(f"🔇 Discarding likely echo transcription: '{text}'")
+                    continue
+            
+            # Check if this was an interruption of Santa speaking
             with state_lock:
-                was_interruption = current_state['was_interrupted']
+                was_santa_interrupted = current_state['was_interrupted']
                 current_state['was_interrupted'] = False  # Reset the flag
                 
-                if was_interruption:
+                if was_santa_interrupted:
                     print(f"\n🔊 Santa was interrupted while speaking!")
-                    print(f"📝 New interruption text: '{text}'")
-                    # Clear any pending merge since this is fresh input
+                    print(f"📝 Interruption text: '{text}'")
+                    # Clear any pending text merge since this is fresh input after interrupting Santa
                     current_state['last_transcription'] = ''
                     merged_text = text
                 elif current_state['last_transcription'] and not current_state['playing_audio']:
-                    print(f"\n🔗 MERGING TRANSCRIPTIONS!")
+                    print(f"\n🔗 MERGING WITH PREVIOUS TRANSCRIPTION!")
                     print(f"📝 Previous text: '{current_state['last_transcription']}'")
                     print(f"📝 New text: '{text}'")
                     merged_text = current_state['last_transcription'] + " " + text
                     print(f"✅ Combined text: '{merged_text}'")
-                    print(f"🎅 Sending merged text to Santa...\n")
                 else:
                     print(f"\n📝 Sending text to Santa: '{text}'")
                     merged_text = text
@@ -642,6 +958,9 @@ if __name__ == "__main__":
             if response is None:
                 print("⚠️ Response interrupted, continuing to listen...\n")
                 continue
+            
+            # Reset conversation timer after successful response
+            last_response_time = time.time()
             
             print("="*50 + "\n")
             
